@@ -87,10 +87,74 @@ class YieldCurve(Model):
         gradient_vector: List[np.ndarray],
         scaler: float = 1.0, accumulate: bool = False,
     ) -> None:
-        """Write raw DF derivatives into component-ordered blocks in place."""
-        # TODO 2: Follow the reference chain recursively and apply the product rule.
-        # Use the model helpers; scale the new contribution and overwrite or accumulate.
-        raise NotImplementedError("TODO 2")
+        """Write raw DF derivatives into component-ordered blocks in place.
+
+        The model discount factor follows the reference chain of ``index``,
+
+            D(T) = D_k(T) * D_{k-1}(T) * ... * D_1(T),
+
+        where D_k is the local factor of the requested component and the
+        others belong to its reference, that reference's reference, and so on
+        (for ``SOFR-1B-FLAT``: D_funding = D_spread * D_SOFR). By the product
+        rule, the derivative with respect to one component's state is its own
+        local derivative times the product of every *other* local factor in
+        the chain,
+
+            dD/df^(j) = (prod_{i != j} D_i) * dD_j/df^(j),
+
+        and components outside the chain have zero derivative.
+
+        ``gradient_vector`` is a list with one block per model component in
+        registration order; it is (re)allocated with ``resize_gradient`` when
+        needed. ``scaler`` multiplies the new contribution. With
+        ``accumulate=False`` every block is replaced (blocks outside the chain
+        become zero); with ``True`` the contribution is added to the existing
+        contents. Returns ``None``.
+        """
+        self.resize_gradient(gradient_vector)
+        if not accumulate:
+            for block in gradient_vector:
+                block.fill(0.0)
+
+        visited = set()
+
+        def gradient_with_reference(component_index, upstream_factor: float) -> float:
+            """Accumulate this component's contribution, then its references'.
+
+            ``upstream_factor`` is the product of the local discount factors of
+            the components that reference this one (already visited on the way
+            down). Returns the discount factor of the sub-chain that starts
+            here: this component's local factor times everything it references.
+            """
+            this_component: YieldCurveModelComponent = self.retrieve_model_component(
+                component_index
+            )
+            this_index = this_component.component_identifier
+            component_name = this_index.name()
+            if component_name in visited:
+                raise ValueError(f"Circular yield-curve reference: {component_name}")
+            visited.add(component_name)
+
+            local_df = this_component.discount_factor(expiry_date)
+            downstream_factor = 1.0
+            reference_index = getattr(this_index, "reference_index", None)
+            if reference_index is not None:
+                downstream_factor = gradient_with_reference(
+                    reference_index, upstream_factor * local_df
+                )
+
+            # Product rule: this component's local derivative, scaled by the
+            # local factors of everything else in the chain (above and below).
+            block = self.retrieve_model_component_index(component_name)
+            this_component.discount_factor_gradient_wrt_state(
+                expiry_date,
+                gradient_vector[block],
+                scaler=scaler * upstream_factor * downstream_factor,
+                accumulate=True,
+            )
+            return local_df * downstream_factor
+
+        gradient_with_reference(index, 1.0)
 
 
 class YieldCurveModelComponent(ModelComponent):
@@ -159,10 +223,43 @@ class YieldCurveModelComponent(ModelComponent):
         self, expiry_date: Date, gradient_vector: np.ndarray,
         scaler: float = 1.0, accumulate: bool = False,
     ) -> None:
-        """Write raw local DF derivatives into the supplied array in place."""
-        # TODO 1: Calculate the local DF gradient using the interpolator's integral gradient.
-        # Apply scaler to the new contribution; overwrite or add according to accumulate.
-        raise NotImplementedError("TODO 1")
+        """Write raw local DF derivatives into the supplied array in place.
+
+        The local discount factor is D(T) = exp(-I(T)) with
+        I(T) = int_0^T f(s) ds and f the IFR interpolated from the node
+        values f_i. The integral is linear in the node values, so its
+        gradient w_i = dI/df_i comes straight from the interpolator
+        (``gradient_of_integrated_value_wrt_ordinate``), and the chain rule
+        gives
+
+            dD/df_i = -D(T) * w_i.
+
+        ``scaler`` multiplies the new contribution. With ``accumulate=False``
+        the contribution replaces the array's contents; with ``True`` it is
+        added to them. The array is modified in place and ``None`` returned.
+        """
+        if not isinstance(gradient_vector, np.ndarray) or gradient_vector.ndim != 1:
+            raise TypeError("gradient_vector must be a one-dimensional NumPy array")
+        if not np.issubdtype(gradient_vector.dtype, np.floating):
+            raise TypeError("gradient_vector must have a floating-point dtype")
+        if len(gradient_vector) != self.num_state_data:
+            raise ValueError(
+                f"gradient_vector has length {len(gradient_vector)}; "
+                f"this component has {self.num_state_data} state variables"
+            )
+
+        # discount_factor validates the date and fixes the time convention.
+        discount_factor = self.discount_factor(expiry_date)
+        time_to_expiry = accrued(self.value_date, expiry_date)
+        weights = self.state_data_interpolator.gradient_of_integrated_value_wrt_ordinate(
+            0.0, time_to_expiry
+        )
+        contribution = -scaler * discount_factor * np.asarray(weights, dtype=float)
+
+        if accumulate:
+            gradient_vector += contribution
+        else:
+            gradient_vector[:] = contribution
 
 
 ModelDeserializerRegistry().register(YieldCurve._model_type.to_string(), YieldCurve.deserialize)
